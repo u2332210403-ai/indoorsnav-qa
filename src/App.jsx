@@ -395,16 +395,20 @@ export default function App(){
       const a = loadAnchorsFromCsv(tA);
       const c = loadConnectionsFromJson(tC);
       applyLoadedData(a, c, "manual files");
+      setAutoLoadTried(true);
+      setAutoLoadOk(true);
     }catch(err){
       console.error(err);
       alert(String(err && err.message ? err.message : err));
       setStatus("Load failed. Check console.");
+      setAutoLoadTried(true);
+      setAutoLoadOk(false);
     }
   }
 
   async function autoLoadDefaultData(){
     try{
-      setStatus("Auto-loading default files…");
+      setStatus("Auto-loading default files...");
 
       const anchorsRes = await fetch("/data/la_zenia_L0_v1_anchors.csv", { cache: "no-store" });
       if(!anchorsRes.ok) throw new Error(`Default anchors CSV not found: ${anchorsRes.status}`);
