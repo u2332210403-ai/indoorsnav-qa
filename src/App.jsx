@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+
 function clamp(v,min,max){return Math.max(min,Math.min(max,v));}
 function clamp01(v){return clamp(v,0,1);}
 function toNum(v){
@@ -58,6 +59,8 @@ function flattenMaybeWrappedJson(j){
   if(j && Array.isArray(j.data)) return j.data;
   if(j && Array.isArray(j.connections)) return j.connections;
   if(j && Array.isArray(j.anchors)) return j.anchors;
+  if(j && Array.isArray(j.edges)) return j.edges;
+  if(j && Array.isArray(j.links)) return j.links;
   return [];
 }
 function detectType(a){
@@ -68,7 +71,19 @@ function detectType(a){
   const area=String(a.area_type||"").toUpperCase();
   if(id.startsWith("NODE_DOOR_") || t.includes("DOOR") || cls.includes("DOOR")) return "door";
   if(t.includes("PLAZA") || id.startsWith("PLZ_")) return "plaza";
-  if(a.vertical===true || String(a.vertical||"").toUpperCase()==="TRUE" || t.includes("ESC") || t.includes("ELV") || t.includes("STAIR") || t.includes("RAMP") || t.includes("STR") || id.startsWith("ESC_") || id.startsWith("ELV_") || id.startsWith("STR_") || id.startsWith("RAMP_")) return "vertical";
+  if(
+    a.vertical===true ||
+    String(a.vertical||"").toUpperCase()==="TRUE" ||
+    t.includes("ESC") ||
+    t.includes("ELV") ||
+    t.includes("STAIR") ||
+    t.includes("RAMP") ||
+    t.includes("STR") ||
+    id.startsWith("ESC_") ||
+    id.startsWith("ELV_") ||
+    id.startsWith("STR_") ||
+    id.startsWith("RAMP_")
+  ) return "vertical";
   if(t.includes("PARK") || area.includes("PARKING") || id.startsWith("PARK_")) return "parking";
   if(role.includes("AMENITY") || t.includes("ATM") || t.includes("WC") || t.includes("INFO") || t.includes("BUS") || t.includes("TAXI") || t.includes("POI")) return "poi";
   return "corridor";
@@ -103,39 +118,6 @@ function dist(ax,ay,bx,by){
   const dx=ax-bx, dy=ay-by;
   return Math.sqrt(dx*dx+dy*dy);
 }
-function buildAdj(edges, accessibleOnly){
-  const m=new Map();
-  for(const e of edges){
-    if(accessibleOnly && e.blockedForFilter) continue;
-    if(!m.has(e.from)) m.set(e.from,[]);
-    if(!m.has(e.to)) m.set(e.to,[]);
-    m.get(e.from).push(e.to);
-    if(e.bidirectional) m.get(e.to).push(e.from);
-  }
-  return m;
-}
-function bfs(start,end,adj){
-  if(!start || !end || !adj.has(start) || !adj.has(end)) return [];
-  const q=[start];
-  const prev=new Map([[start,null]]);
-  for(let i=0;i<q.length;i++){
-    const u=q[i];
-    if(u===end) break;
-    const next=adj.get(u)||[];
-    for(const v of next){
-      if(!prev.has(v)){
-        prev.set(v,u);
-        q.push(v);
-      }
-    }
-  }
-  if(!prev.has(end)) return [];
-  const path=[];
-  let cur=end;
-  while(cur!=null){ path.push(cur); cur=prev.get(cur); }
-  path.reverse();
-  return path;
-}
 function edgeKey(a,b){ return `${a}__${b}`; }
 function fitView(nodes, vw, vh){
   if(!nodes.length) return { scale:1, tx:0, ty:0 };
@@ -155,11 +137,165 @@ function fitView(nodes, vw, vh){
   const ty=(vh - h*scale)/2 - minY*scale;
   return { scale, tx, ty };
 }
+function isIdPrefix(id,prefix){
+  return String(id||"").toUpperCase().startsWith(prefix);
+}
+function isElv(id){ return isIdPrefix(id,"ELV_"); }
+function isStr(id){ return isIdPrefix(id,"STR_"); }
+function isRamp(id){ return isIdPrefix(id,"RAMP_"); }
+function isEsc(id){ return isIdPrefix(id,"ESC_"); }
+function isGarageHub(id){ return isIdPrefix(id,"NODE_PARKING_GARAGE_LVL_"); }
+function isEvCharging(id){ return isIdPrefix(id,"EV_CHARGING_"); }
+function isPark(id){ return isIdPrefix(id,"PARK_"); }
+function isParkingLike(id){
+  const s=String(id||"").toUpperCase();
+  return s.startsWith("PARK_") || s.startsWith("ENT_PARKING_") || s.startsWith("EV_CHARGING_") || s.startsWith("CAR_WASH_") || s.startsWith("NODE_PARKING_GARAGE_LVL_");
+}
+function getAnchorFloor(anchorMap,id){
+  return anchorMap.get(id)?.floor ?? "";
+}
+function distCost(anchorMap,aId,bId){
+  const a=anchorMap.get(aId);
+  const b=anchorMap.get(bId);
+  if(!a || !b) return 1e9;
+  const dx=(b.x-a.x)*1000;
+  const dy=(b.y-a.y)*600;
+  return Math.hypot(dx,dy);
+}
+function buildWeightedAdj(edges, anchorMap){
+  const m=new Map();
+  for(const e of edges){
+    if(e.blockedForFilter) continue;
+    if(!anchorMap.has(e.from) || !anchorMap.has(e.to)) continue;
+    if(!m.has(e.from)) m.set(e.from,[]);
+    if(!m.has(e.to)) m.set(e.to,[]);
+    m.get(e.from).push({ to:e.to, edge:e });
+    if(e.bidirectional) m.get(e.to).push({ to:e.from, edge:e });
+  }
+  return m;
+}
+function hasRampOptionWithin(curId, adjWeighted, anchorMap, threshold){
+  const neigh=adjWeighted.get(curId) || [];
+  for(const item of neigh){
+    if(isRamp(item.to)){
+      if(distCost(anchorMap, curId, item.to) <= threshold) return true;
+    }
+  }
+  return false;
+}
+const TUNE={
+  ELV_PENALTY:10,
+  EV_CHARGING_PENALTY:300,
+  GARAGE_HUB_PENALTY:120,
+  PARK_TO_GARAGE_PENALTY:800,
+  RAMP_BONUS:8,
+  STR_BONUS:1,
+  DIRECT_TO_F0_BONUS:80,
+  B_TO_F1_PENALTY:120,
+  B_TO_F2_PENALTY:160,
+  RAMP_PREF_DISTANCE:20,
+  STR_NEAR_RAMP_PENALTY:250,
+  PARKING_EDGE_PENALTY:220,
+  PARKING_NODE_PENALTY:160,
+  B1_GENERAL_PENALTY:120,
+  FLOOR_CHANGE_PENALTY:60,
+  ESC_PENALTY:25,
+  DOOR_EDGE_PENALTY:4,
+  POI_EDGE_PENALTY:8
+};
+function edgeExtraCost(curId,nxId,visitedF0,adjWeighted,anchorMap,startId,endId){
+  let extra=0;
+  const fCur=getAnchorFloor(anchorMap,curId).toUpperCase();
+  const fNx=getAnchorFloor(anchorMap,nxId).toUpperCase();
+  const startIsParking=isParkingLike(startId);
+  const endIsParking=isParkingLike(endId);
+  const tripNeedsParking=startIsParking || endIsParking;
+  if(isElv(curId) || isElv(nxId)) extra += TUNE.ELV_PENALTY;
+  if(isEsc(curId) || isEsc(nxId)) extra += TUNE.ESC_PENALTY;
+  if(isEvCharging(curId) || isEvCharging(nxId)) extra += TUNE.EV_CHARGING_PENALTY;
+  if(isGarageHub(curId) || isGarageHub(nxId)) extra += TUNE.GARAGE_HUB_PENALTY;
+  if(isPark(curId) && isGarageHub(nxId)) extra += TUNE.PARK_TO_GARAGE_PENALTY;
+  if(isPark(nxId) && isGarageHub(curId)) extra += TUNE.PARK_TO_GARAGE_PENALTY;
+  if(isRamp(curId) || isRamp(nxId)) extra -= TUNE.RAMP_BONUS;
+  if(isStr(curId) || isStr(nxId)) extra -= TUNE.STR_BONUS;
+  if(isStr(nxId) && hasRampOptionWithin(curId,adjWeighted,anchorMap,TUNE.RAMP_PREF_DISTANCE)) extra += TUNE.STR_NEAR_RAMP_PENALTY;
+  if(!visitedF0){
+    if(fNx==="F0") extra -= TUNE.DIRECT_TO_F0_BONUS;
+    if(/^B/i.test(fCur) && fNx==="F1") extra += TUNE.B_TO_F1_PENALTY;
+    if(/^B/i.test(fCur) && fNx==="F2") extra += TUNE.B_TO_F2_PENALTY;
+  }
+  if(fCur !== fNx) extra += TUNE.FLOOR_CHANGE_PENALTY;
+  if(!tripNeedsParking){
+    if(isParkingLike(curId) || isParkingLike(nxId)) extra += TUNE.PARKING_EDGE_PENALTY;
+    if(fCur==="B1" || fNx==="B1") extra += TUNE.B1_GENERAL_PENALTY;
+  }else{
+    const curParking=isParkingLike(curId);
+    const nxParking=isParkingLike(nxId);
+    if((curParking || nxParking) && !(curId===startId || curId===endId || nxId===startId || nxId===endId)){
+      extra += 20;
+    }
+  }
+  const curKind=anchorMap.get(curId)?.kind;
+  const nxKind=anchorMap.get(nxId)?.kind;
+  if(curKind==="door" || nxKind==="door") extra += TUNE.DOOR_EDGE_PENALTY;
+  if(curKind==="poi" || nxKind==="poi") extra += TUNE.POI_EDGE_PENALTY;
+  if((curKind==="parking" || nxKind==="parking") && !tripNeedsParking) extra += TUNE.PARKING_NODE_PENALTY;
+  return extra;
+}
+function dijkstraVisitedF0(startId,endId,adjWeighted,anchorMap){
+  if(!startId || !endId) return [];
+  if(!adjWeighted.has(startId) || !adjWeighted.has(endId)) return [];
+  if(startId===endId) return [startId];
+  const startVF0=(getAnchorFloor(anchorMap,startId).toUpperCase()==="F0");
+  const startKey=`${startId}::${startVF0?1:0}`;
+  const distMap=new Map();
+  const prevMap=new Map();
+  const pq=[{ key:startKey, id:startId, vf0:startVF0, d:0 }];
+  distMap.set(startKey,0);
+  prevMap.set(startKey,null);
+  function popMin(){
+    let bi=0;
+    for(let i=1;i<pq.length;i++) if(pq[i].d < pq[bi].d) bi=i;
+    return pq.splice(bi,1)[0];
+  }
+  while(pq.length){
+    const cur=popMin();
+    if((distMap.get(cur.key) ?? Infinity) < cur.d) continue;
+    if(cur.id===endId){
+      const path=[];
+      let k=cur.key;
+      while(k!=null){
+        path.push(k.split("::")[0]);
+        k=prevMap.get(k);
+      }
+      path.reverse();
+      return path;
+    }
+    const neigh=adjWeighted.get(cur.id) || [];
+    for(const item of neigh){
+      const nx=item.to;
+      const nxVF0=cur.vf0 || (getAnchorFloor(anchorMap,nx).toUpperCase()==="F0");
+      const nxKey=`${nx}::${nxVF0?1:0}`;
+      const base=distCost(anchorMap,cur.id,nx);
+      const extra=edgeExtraCost(cur.id,nx,cur.vf0,adjWeighted,anchorMap,startId,endId);
+      const w=Math.max(0.001,base+extra);
+      const nd=cur.d+w;
+      if(nd < (distMap.get(nxKey) ?? Infinity)){
+        distMap.set(nxKey,nd);
+        prevMap.set(nxKey,cur.key);
+        pq.push({ key:nxKey, id:nx, vf0:nxVF0, d:nd });
+      }
+    }
+  }
+  return [];
+}
+
 export default function App(){
   const svgRef=useRef(null);
   const wrapRef=useRef(null);
   const fileAnchRef=useRef(null);
   const fileConnRef=useRef(null);
+
   const [anchorsRaw,setAnchorsRaw]=useState([]);
   const [connectionsRaw,setConnectionsRaw]=useState([]);
   const [loading,setLoading]=useState(true);
@@ -180,6 +316,7 @@ export default function App(){
   const [dragging,setDragging]=useState(false);
   const [info,setInfo]=useState(null);
   const touchState=useRef({ mode:"none", startDist:0, startScale:1, startMid:{x:0,y:0}, startTx:0, startTy:0, last:{x:0,y:0} });
+
   useEffect(()=>{
     (async()=>{
       try{
@@ -222,14 +359,13 @@ export default function App(){
       }
     })();
   },[]);
+
   const anchors=useMemo(()=>{
-    const missing=[];
     const out=(anchorsRaw||[]).map(r=>{
       const anchor_id=String(firstOf(r,["anchor_id","id","anchorid","name_id","node_id"])).trim();
       const x=toNum(firstOf(r,["x","lonx","px","pos_x"]));
       const y=toNum(firstOf(r,["y","laty","py","pos_y"]));
-      const floor=String(firstOf(r,["floor","level","lvl"])).trim() || "UNKNOWN";
-      if(!anchor_id || !Number.isFinite(x) || !Number.isFinite(y)) missing.push(r);
+      const floor=String(firstOf(r,["floor","level","lvl"])).trim().toUpperCase() || "UNKNOWN";
       const obj={
         anchor_id,
         anchor_type:String(firstOf(r,["anchor_type","type"])).trim(),
@@ -258,11 +394,13 @@ export default function App(){
       return true;
     });
   },[anchorsRaw]);
+
   const anchorMap=useMemo(()=>{
     const m=new Map();
     for(const a of anchors) m.set(a.anchor_id,a);
     return m;
   },[anchors]);
+
   const connections=useMemo(()=>{
     const out=[];
     for(const r of (connectionsRaw||[])){
@@ -281,21 +419,25 @@ export default function App(){
     }
     return out;
   },[connectionsRaw,anchorMap,wheelchair,stroller,luggage]);
+
   const floors=useMemo(()=>{
     const s=new Set(["ALL"]);
     for(const a of anchors) s.add(a.floor || "UNKNOWN");
     return Array.from(s);
   },[anchors]);
+
   const visibleAnchors=useMemo(()=>{
     let arr=anchors;
     if(currentFloor!=="ALL") arr=arr.filter(a=>a.floor===currentFloor);
     return [...arr].sort((a,b)=>typeRank(a.kind)-typeRank(b.kind));
   },[anchors,currentFloor]);
+
   const visibleAnchorMap=useMemo(()=>{
     const m=new Map();
     for(const a of visibleAnchors) m.set(a.anchor_id,a);
     return m;
   },[visibleAnchors]);
+
   const visibleConnections=useMemo(()=>{
     return connections.filter(e=>{
       const a=visibleAnchorMap.get(e.from);
@@ -303,15 +445,20 @@ export default function App(){
       return !!a && !!b;
     });
   },[connections,visibleAnchorMap]);
-  const adj=useMemo(()=>buildAdj(visibleConnections,true),[visibleConnections]);
+
+  const routeAdjWeighted=useMemo(()=>{
+    return buildWeightedAdj(visibleConnections, visibleAnchorMap);
+  },[visibleConnections,visibleAnchorMap]);
+
   useEffect(()=>{
     if(startId && endId){
-      const p=bfs(startId,endId,adj);
+      const p=dijkstraVisitedF0(startId,endId,routeAdjWeighted,visibleAnchorMap);
       setRoute(p);
     }else{
       setRoute([]);
     }
-  },[startId,endId,adj]);
+  },[startId,endId,routeAdjWeighted,visibleAnchorMap]);
+
   const routeEdgeSet=useMemo(()=>{
     const s=new Set();
     for(let i=0;i<route.length-1;i++){
@@ -320,6 +467,7 @@ export default function App(){
     }
     return s;
   },[route]);
+
   const stats=useMemo(()=>{
     const graphNodes=new Set();
     for(const e of visibleConnections){
@@ -333,6 +481,7 @@ export default function App(){
       graphNodes:graphNodes.size
     };
   },[anchors,visibleAnchors,visibleConnections]);
+
   useEffect(()=>{
     const el=wrapRef.current;
     if(!el) return;
@@ -346,6 +495,7 @@ export default function App(){
     ro.observe(el);
     return ()=>ro.disconnect();
   },[visibleAnchors]);
+
   function worldToScreen(x,y){
     return { x:x*viewport.scale + viewport.tx, y:y*viewport.scale + viewport.ty };
   }
@@ -516,7 +666,9 @@ export default function App(){
     }
     setConnectionsRaw(arr||[]);
   }
+
   const selectedAnchor=selectedId ? (visibleAnchorMap.get(selectedId) || anchorMap.get(selectedId)) : null;
+
   return (
     <div style={{height:"100vh",display:"flex",flexDirection:"column",background:"#0b1220",color:"#e5e7eb",fontFamily:"system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif"}}>
       <div style={{padding:"8px 10px",borderBottom:"1px solid #1f2937",background:"#0f172a",position:"sticky",top:0,zIndex:20}}>
@@ -528,17 +680,21 @@ export default function App(){
           <button onClick={clearRoute} style={btnSmall()}>Clear Route</button>
           <button onClick={clearSelection} style={btnSmall()}>Clear Selection</button>
         </div>
+
         {panelOpen && (
           <div style={{marginTop:8,display:"grid",gridTemplateColumns:"1fr",gap:8}}>
             <div style={{fontSize:13,lineHeight:1.35,opacity:0.9}}>
               Loaded Anchors {stats.loadedAnchors} | Visible {stats.visibleAnchors} | Connections {stats.connections} | Graph nodes {stats.graphNodes}<br/>
               Access filter: wheelchair={String(wheelchair)} stroller={String(stroller)} luggage={String(luggage)}<br/>
+              Route mode: weighted Dijkstra | prefer same-floor public paths | penalize parking/B1/vertical detours | prefer ramp over stairs when nearby<br/>
               Tap workflow: first tap = START | second tap = END | third tap restarts | Start: {startId || "—"} | End: {endId || "—"} | Last tap: {lastTap || "—"} | {loading ? "Loading..." : loadMsg}
             </div>
+
             <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:8}}>
               <input value={searchText} onChange={e=>setSearchText(e.target.value)} onKeyDown={e=>{ if(e.key==="Enter") searchAndCenter(); }} placeholder="Search anchor ID or name" style={inputStyle()}/>
               <button onClick={searchAndCenter} style={btnSmallPrimary()}>Find</button>
             </div>
+
             {menuOpen && (
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
                 <div style={{display:"flex",flexDirection:"column",gap:8}}>
@@ -549,20 +705,23 @@ export default function App(){
                     {floors.map(f=><option key={f} value={f}>{f}</option>)}
                   </select>
                 </div>
+
                 <div style={{display:"flex",flexDirection:"column",gap:8}}>
                   <button onClick={()=>fileAnchRef.current?.click()} style={btnSmall()}>Import Anchors</button>
                   <button onClick={()=>fileConnRef.current?.click()} style={btnSmall()}>Import Connections</button>
                   <div style={{fontSize:12,opacity:0.85,lineHeight:1.35}}>
-                    Mobile use:<br/>• Drag = pan<br/>• Pinch = zoom<br/>• Tap node = info / route<br/>• Labels appear when zoomed in
+                    Desktop / mobile use:<br/>• Drag = pan<br/>• Pinch or wheel = zoom<br/>• Tap node = info / route<br/>• Labels appear when zoomed in
                   </div>
                 </div>
               </div>
             )}
           </div>
         )}
+
         <input ref={fileAnchRef} type="file" accept=".csv,.json,.txt" style={{display:"none"}} onChange={async e=>{ const f=e.target.files?.[0]; if(f) await importAnchorsFile(f); e.target.value=""; }}/>
         <input ref={fileConnRef} type="file" accept=".csv,.json,.txt" style={{display:"none"}} onChange={async e=>{ const f=e.target.files?.[0]; if(f) await importConnectionsFile(f); e.target.value=""; }}/>
       </div>
+
       <div style={{display:"flex",flex:"1 1 auto",minHeight:0}}>
         <div ref={wrapRef} style={{position:"relative",flex:"1 1 auto",minWidth:0,background:"#f8fafc",overflow:"hidden",touchAction:"none"}}>
           <svg
@@ -581,6 +740,7 @@ export default function App(){
             style={{display:"block",width:"100%",height:"100%",background:"#f8fafc",cursor:dragging?"grabbing":"grab"}}
           >
             <rect x="0" y="0" width="100%" height="100%" fill="#f8fafc"/>
+
             <g>
               {visibleConnections.map((e,i)=>{
                 const a=visibleAnchorMap.get(e.from);
@@ -604,6 +764,7 @@ export default function App(){
                 );
               })}
             </g>
+
             <g>
               {visibleAnchors.map(a=>{
                 const z=viewport.scale/800;
@@ -645,14 +806,41 @@ export default function App(){
               })}
             </g>
           </svg>
+
           <div style={{position:"absolute",right:10,bottom:10,display:"flex",flexDirection:"column",gap:8,zIndex:10}}>
-            <button onClick={()=>setViewport(v=>{ const rect=wrapRef.current.getBoundingClientRect(); const sx=rect.width/2; const sy=rect.height/2; const before=screenToWorld(sx,sy); const scale=clamp(v.scale*1.2,120,24000); return { scale, tx:sx-before.x*scale, ty:sy-before.y*scale }; })} style={zoomBtn()}>+</button>
-            <button onClick={()=>setViewport(v=>{ const rect=wrapRef.current.getBoundingClientRect(); const sx=rect.width/2; const sy=rect.height/2; const before=screenToWorld(sx,sy); const scale=clamp(v.scale*0.84,120,24000); return { scale, tx:sx-before.x*scale, ty:sy-before.y*scale }; })} style={zoomBtn()}>−</button>
+            <button
+              onClick={()=>{
+                setViewport(v=>{
+                  const rect=wrapRef.current.getBoundingClientRect();
+                  const sx=rect.width/2;
+                  const sy=rect.height/2;
+                  const before=screenToWorld(sx,sy);
+                  const scale=clamp(v.scale*1.2,120,24000);
+                  return { scale, tx:sx-before.x*scale, ty:sy-before.y*scale };
+                });
+              }}
+              style={zoomBtn()}
+            >+</button>
+            <button
+              onClick={()=>{
+                setViewport(v=>{
+                  const rect=wrapRef.current.getBoundingClientRect();
+                  const sx=rect.width/2;
+                  const sy=rect.height/2;
+                  const before=screenToWorld(sx,sy);
+                  const scale=clamp(v.scale*0.84,120,24000);
+                  return { scale, tx:sx-before.x*scale, ty:sy-before.y*scale };
+                });
+              }}
+              style={zoomBtn()}
+            >−</button>
           </div>
+
           <div style={{position:"absolute",left:10,bottom:10,background:"rgba(15,23,42,0.92)",color:"#e5e7eb",padding:"8px 10px",borderRadius:10,fontSize:12,lineHeight:1.35,zIndex:10,maxWidth:"78vw"}}>
             Legend: <span style={{color:"#111111"}}>●</span> corridor <span style={{color:"#2563eb"}}>●</span> plaza <span style={{color:"#dc2626"}}>●</span> vertical <span style={{color:"#16a34a"}}>●</span> door <span style={{color:"#d97706"}}>●</span> poi <span style={{color:"#7c3aed"}}>●</span> parking
           </div>
         </div>
+
         <div style={{width:selectedAnchor || info ? 310 : 0,transition:"width 0.18s ease",overflow:"hidden",borderLeft:selectedAnchor || info ? "1px solid #1f2937" : "none",background:"#111827"}}>
           <div style={{width:310,height:"100%",display:"flex",flexDirection:"column"}}>
             <div style={{padding:"10px 12px",borderBottom:"1px solid #1f2937",fontWeight:800}}>Anchor Info</div>
@@ -661,22 +849,31 @@ export default function App(){
                 <>
                   <div style={kvHead()}>ANCHOR_ID</div>
                   <div style={kvVal()}>{info.anchor.anchor_id}</div>
+
                   <div style={kvHead()}>NAME</div>
                   <div style={kvVal()}>{info.anchor.name || "—"}</div>
+
                   <div style={kvHead()}>TYPE</div>
                   <div style={kvVal()}>{info.anchor.kind}</div>
+
                   <div style={kvHead()}>ANCHOR_TYPE</div>
                   <div style={kvVal()}>{info.anchor.anchor_type || "—"}</div>
+
                   <div style={kvHead()}>FLOOR</div>
                   <div style={kvVal()}>{info.anchor.floor || "—"}</div>
+
                   <div style={kvHead()}>VERTICAL</div>
                   <div style={kvVal()}>{String(info.anchor.vertical)}</div>
+
                   <div style={kvHead()}>XY</div>
                   <div style={kvVal()}>{info.anchor.x.toFixed(4)}, {info.anchor.y.toFixed(4)}</div>
+
                   <div style={kvHead()}>CONNECTIONS</div>
                   <div style={kvVal()}>{info.connections}</div>
+
                   <div style={kvHead()}>CONNECTED TO</div>
                   <div style={{...kvVal(),whiteSpace:"pre-wrap"}}>{info.linked.length ? info.linked.join("\n") : "—"}</div>
+
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:12}}>
                     <button onClick={()=>setStartId(info.anchor.anchor_id)} style={btnSmallPrimary()}>Set Start</button>
                     <button onClick={()=>setEndId(info.anchor.anchor_id)} style={btnSmallPrimary()}>Set End</button>
@@ -692,6 +889,7 @@ export default function App(){
     </div>
   );
 }
+
 function btnSmall(){
   return {background:"#1f2937",color:"#e5e7eb",border:"1px solid #334155",borderRadius:10,padding:"8px 10px",fontWeight:700,fontSize:13};
 }
