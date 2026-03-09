@@ -1,4 +1,4 @@
-/* FILE NAME: src/App.jsx (FULL WORKING VITE REACT APP — CSV + JSON + PROXIMITY DIJKSTRA + VISITED-F0 STATE + ROUTE STEPS + __lastRoute) */
+/* FILE NAME: src/App.jsx (FULL WORKING VITE REACT APP — AUTOLOAD DEFAULT CSV + JSON + MANUAL FILE LOAD + PROXIMITY DIJKSTRA + VISITED-F0 STATE + ROUTE STEPS + __lastRoute) */
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /* ===================== HELPERS ===================== */
@@ -148,8 +148,11 @@ export default function App(){
   const [route, setRoute] = useState(null); // array of ids
   const [focusedId, setFocusedId] = useState(null);
 
-  const [status, setStatus] = useState("Ready: choose anchors CSV + connections JSON, then Load.");
+  const [status, setStatus] = useState("Ready: auto-loading default files...");
   const [jsonSample, setJsonSample] = useState("(none)");
+
+  const [autoLoadTried, setAutoLoadTried] = useState(false);
+  const [autoLoadOk, setAutoLoadOk] = useState(false);
 
   /* ===================== PAN/ZOOM (viewBox) ===================== */
   const svgRef = useRef(null);
@@ -176,10 +179,8 @@ export default function App(){
     const adj = new Map();
     const degrees = new Map();
 
-    // initialize
     for(const a of anchors) adj.set(a.id, new Set());
 
-    // optional accessibility filter
     const needAny = needWheelchair || needStroller || needLuggage;
 
     let missing = 0;
@@ -187,7 +188,6 @@ export default function App(){
       const from=c.from, to=c.to;
       if(!anchorsById.has(from) || !anchorsById.has(to)) { missing++; continue; }
 
-      // If user requires accessibility, only allow edges that support it.
       if(needAny){
         if(needWheelchair && !c.wheelchair) continue;
         if(needStroller && !c.stroller) continue;
@@ -252,26 +252,19 @@ export default function App(){
     const a=anchorsById.get(aId);
     const b=anchorsById.get(bId);
     if(!a || !b) return 1e9;
-    // scale to something "meter-like" for consistent weighting
     const dx=(b.x-a.x)*1000;
     const dy=(b.y-a.y)*600;
     return Math.hypot(dx,dy);
   }
 
-  // Tunables (keep distance dominant)
   const TUNE = useMemo(()=>({
-    // elevator is OK if it is close; we only add a small penalty
     ELV_PENALTY: 10,
     GARAGE_HUB_PENALTY: 20,
-
-    // prefer ramps/stairs slightly (small, distance still dominates)
     RAMP_BONUS: 5,
     STR_BONUS: 2,
-
-    // "above ground asap" bias BEFORE touching F0
-    DIRECT_TO_F0_BONUS: 80,      // subtract if next is F0
-    VIA_CONNECTOR_TO_F0_BONUS: 40, // subtract if using vertical connector that lands in F0 (handled by checking next floor)
-    B_TO_F1_PENALTY: 120,         // add if B* -> F1 before ever visiting F0
+    DIRECT_TO_F0_BONUS: 80,
+    VIA_CONNECTOR_TO_F0_BONUS: 40,
+    B_TO_F1_PENALTY: 120,
     B_TO_F2_PENALTY: 160
   }), []);
 
@@ -284,22 +277,15 @@ export default function App(){
     if(idIsRamp(curId) || idIsRamp(nxId)) extra -= TUNE.RAMP_BONUS;
     if(idIsStr(curId) || idIsStr(nxId)) extra -= TUNE.STR_BONUS;
 
-    // tiny corridor preference (optional)
     if(idIsCorr(nxId)) extra -= 1;
 
-    // "above ground asap" only before visiting F0
     if(!visitedF0){
       const fCur=getFloor(curId);
       const fNx=getFloor(nxId);
 
       if(fNx === "F0") extra -= TUNE.DIRECT_TO_F0_BONUS;
-
-      // penalize going from basement to F1/F2 before reaching F0
       if(/^B/i.test(fCur) && /^F1$/i.test(fNx)) extra += TUNE.B_TO_F1_PENALTY;
       if(/^B/i.test(fCur) && /^F2$/i.test(fNx)) extra += TUNE.B_TO_F2_PENALTY;
-
-      // bonus if moving "toward" F0 via vertical connector landing at F0 (covered by fNx==="F0")
-      // leaving hook here for future tuning
     }
 
     return extra;
@@ -310,16 +296,14 @@ export default function App(){
     if(!adj.has(start) || !adj.has(end)) return null;
     if(start===end) return [start];
 
-    // state is (id, visitedF0Flag)
     const startVF0 = (getFloor(start) === "F0");
     const startKey = `${start}::${startVF0 ? 1 : 0}`;
 
     const dist = new Map();
-    const prev = new Map(); // key -> prevKey
+    const prev = new Map();
     dist.set(startKey, 0);
     prev.set(startKey, null);
 
-    // small priority queue (array)
     const pq = [{ key: startKey, id: start, vf0: startVF0, d: 0 }];
 
     function popMin(){
@@ -335,7 +319,6 @@ export default function App(){
       if((dist.get(cur.key) ?? Infinity) < cur.d) continue;
 
       if(cur.id === end){
-        // reconstruct
         const pathIds=[];
         let k=cur.key;
         while(k!=null){
@@ -374,7 +357,6 @@ export default function App(){
     setRoute(path);
   }
 
-  /* expose to console */
   useEffect(()=>{
     window.__lastRoute = route ? route.slice() : null;
   }, [route]);
@@ -389,6 +371,20 @@ export default function App(){
     });
   }
 
+  function applyLoadedData(a, c, sourceLabel){
+    setAnchors(a);
+    setConnections(c);
+    setJsonSample(c[0] ? JSON.stringify(c[0]) : "(none)");
+    setFloor("ALL");
+    setQaFloor("ALL");
+    setStartId("");
+    setEndId("");
+    setRoute(null);
+    setFocusedId(null);
+    resetView();
+    setStatus(`Loaded from ${sourceLabel}. Pick Start/End and route.`);
+  }
+
   async function onLoadFiles(anchorFile, connFile){
     if(!anchorFile) { alert("Pick anchors CSV first."); return; }
     if(!connFile) { alert("Pick connections JSON second."); return; }
@@ -396,30 +392,46 @@ export default function App(){
     try{
       setStatus("Loading files…");
       const [tA, tC] = await Promise.all([readTextFromFile(anchorFile), readTextFromFile(connFile)]);
-
       const a = loadAnchorsFromCsv(tA);
       const c = loadConnectionsFromJson(tC);
-
-      setAnchors(a);
-      setConnections(c);
-
-      setJsonSample(c[0] ? JSON.stringify(c[0]) : "(none)");
-
-      setFloor("ALL");
-      setQaFloor("ALL");
-      setStartId("");
-      setEndId("");
-      setRoute(null);
-      setFocusedId(null);
-      resetView();
-
-      setStatus("Loaded. Pick Start/End and route.");
+      applyLoadedData(a, c, "manual files");
     }catch(err){
       console.error(err);
       alert(String(err && err.message ? err.message : err));
       setStatus("Load failed. Check console.");
     }
   }
+
+  async function autoLoadDefaultData(){
+    try{
+      setStatus("Auto-loading default files…");
+
+      const anchorsRes = await fetch("/data/la_zenia_L0_v1_anchors.csv", { cache: "no-store" });
+      if(!anchorsRes.ok) throw new Error(`Default anchors CSV not found: ${anchorsRes.status}`);
+
+      const connectionsRes = await fetch("/data/la_zenia_L0_v1_connections.json", { cache: "no-store" });
+      if(!connectionsRes.ok) throw new Error(`Default connections JSON not found: ${connectionsRes.status}`);
+
+      const anchorsText = await anchorsRes.text();
+      const connectionsText = await connectionsRes.text();
+
+      const a = loadAnchorsFromCsv(anchorsText);
+      const c = loadConnectionsFromJson(connectionsText);
+
+      applyLoadedData(a, c, "default /data files");
+      setAutoLoadOk(true);
+    }catch(err){
+      console.error("Auto-load failed:", err);
+      setStatus("Auto-load failed. Use manual file pickers.");
+      setAutoLoadOk(false);
+    }finally{
+      setAutoLoadTried(true);
+    }
+  }
+
+  useEffect(()=>{
+    autoLoadDefaultData();
+  }, []);
 
   /* ===================== UI HELPERS ===================== */
   function focusAnchor(id, center){
@@ -482,9 +494,12 @@ export default function App(){
   }, [route, anchorsById]);
 
   useEffect(()=>{
-    // Keep status line informative
     if(anchors.length===0){
-      setStatus("Ready: choose anchors CSV + connections JSON, then Load.");
+      if(!autoLoadTried){
+        setStatus("Ready: auto-loading default files...");
+      }else if(!autoLoadOk){
+        setStatus("Auto-load failed. Use manual file pickers.");
+      }
       return;
     }
     setStatus(
@@ -492,9 +507,10 @@ export default function App(){
       `Mode: CSV (; or ,) + JSON (array or wrapped) | Force bidirectional: ${forceBidirectional}\n`+
       `Access filter: wheelchair=${needWheelchair} stroller=${needStroller} luggage=${needLuggage}\n`+
       `Missing IDs skipped: ${missingIdCount}\n`+
+      `Auto-load tried: ${autoLoadTried} | Auto-load ok: ${autoLoadOk}\n`+
       `JSON sample: ${jsonSample}`
     );
-  }, [anchors.length, visibleCount, connections.length, graphNodeCount, allIds.length, forceBidirectional, needWheelchair, needStroller, needLuggage, missingIdCount, jsonSample]);
+  }, [anchors.length, visibleCount, connections.length, graphNodeCount, allIds.length, forceBidirectional, needWheelchair, needStroller, needLuggage, missingIdCount, jsonSample, autoLoadTried, autoLoadOk]);
 
   return (
     <div style={{padding:14, fontFamily:"system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"}}>
@@ -503,19 +519,21 @@ export default function App(){
       <div style={{display:"flex",flexWrap:"wrap",gap:10,alignItems:"center",margin:"10px 0"}}>
         <label style={{display:"flex",gap:6,alignItems:"center"}}>
           <span>Anchors CSV:</span>
-          <input id="anchorsFile" type="file" accept=".csv,.txt"
-            onChange={async (e)=>{
-              // do nothing here; load button uses both files
-            }}
+          <input
+            id="anchorsFile"
+            type="file"
+            accept=".csv,.txt"
+            onChange={async ()=>{}}
           />
         </label>
 
         <label style={{display:"flex",gap:6,alignItems:"center"}}>
           <span>Connections JSON:</span>
-          <input id="connsFile" type="file" accept=".json"
-            onChange={async (e)=>{
-              // do nothing here; load button uses both files
-            }}
+          <input
+            id="connsFile"
+            type="file"
+            accept=".json"
+            onChange={async ()=>{}}
           />
         </label>
 
@@ -528,6 +546,13 @@ export default function App(){
           style={{background:"#111827",color:"#e6edf3",border:0,borderRadius:10,padding:"8px 12px",cursor:"pointer"}}
         >
           Load (CSV + JSON)
+        </button>
+
+        <button
+          onClick={autoLoadDefaultData}
+          style={{background:"#111827",color:"#e6edf3",border:0,borderRadius:10,padding:"8px 12px",cursor:"pointer"}}
+        >
+          Reload Default Data
         </button>
 
         <button
@@ -617,7 +642,6 @@ export default function App(){
           onMouseMove={onMouseMove}
           style={{background:"#fff",display:"block",userSelect:"none"}}
         >
-          {/* anchors */}
           {visibleAnchors.map(a=>{
             const isS = startId && a.id===startId;
             const isE = endId && a.id===endId;
@@ -646,7 +670,6 @@ export default function App(){
             );
           })}
 
-          {/* route polyline */}
           {routePoints.length>=2 && (
             <polyline
               fill="none"
@@ -658,7 +681,6 @@ export default function App(){
             />
           )}
 
-          {/* route node markers */}
           {route && route.length>0 && route.map((id, idx)=>{
             const a=anchorsById.get(id);
             if(!a) return null;
@@ -673,7 +695,6 @@ export default function App(){
         </svg>
       </div>
 
-      {/* QA Panel */}
       <div style={{marginTop:12,border:"1px solid #e5e7eb",borderRadius:12,padding:10,width:"min(980px, 100%)"}}>
         <div style={{display:"flex",justifyContent:"space-between",gap:10,flexWrap:"wrap",alignItems:"center"}}>
           <div style={{fontWeight:700}}>QA Panel</div>
