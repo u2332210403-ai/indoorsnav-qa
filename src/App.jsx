@@ -409,7 +409,7 @@ export default function App(){
       const anchorsRes = await fetch("/data/la_zenia_L0_v1_anchors.csv", { cache: "no-store" });
       if(!anchorsRes.ok) throw new Error(`Default anchors CSV not found: ${anchorsRes.status}`);
 
-      const connectionsRes = await fetch("/data/la_zenia_L0_v1_connections.json", { cache: "no-store" });
+      const connectionsRes = await fetch("/data/la_zenia_L0_v1.json", { cache: "no-store" });
       if(!connectionsRes.ok) throw new Error(`Default connections JSON not found: ${connectionsRes.status}`);
 
       const anchorsText = await anchorsRes.text();
